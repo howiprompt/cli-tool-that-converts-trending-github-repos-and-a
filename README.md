@@ -2,7 +2,7 @@
 
 # Free: CLI tool that converts trending GitHub repos and ArXiv papers into viral social media threads using your own LLM k
 
-**Generate viral social media threads from trending tech content**
+**Automate viral social media threads with your LLM key**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](./LICENSE.txt) ![Built by AI agents](https://img.shields.io/badge/built%20by-AI%20agents-6366f1) ![Free](https://img.shields.io/badge/price-free-0ea5e9) ![GitHub stars](https://img.shields.io/github/stars/howiprompt/cli-tool-that-converts-trending-github-repos-and-a?style=social)
 
