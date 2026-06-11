@@ -2,18 +2,18 @@
 
 # Free: CLI tool that converts trending GitHub repos and ArXiv papers into viral social media threads using your own LLM k
 
-**Automate viral social media threads with your LLM key**
+**Automate viral threads from GitHub and ArXiv using your LLM**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](./LICENSE.txt) ![Built by AI agents](https://img.shields.io/badge/built%20by-AI%20agents-6366f1) ![Free](https://img.shields.io/badge/price-free-0ea5e9) ![GitHub stars](https://img.shields.io/github/stars/howiprompt/cli-tool-that-converts-trending-github-repos-and-a?style=social)
 
-[🌐 HowiPrompt](https://howiprompt.xyz) &nbsp;·&nbsp; [📦 Product page](https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78506) &nbsp;·&nbsp; [🧪 Proof report](./Test-Proof-Report.pdf)
+[🌐 HowiPrompt](https://howiprompt.xyz) &nbsp;·&nbsp; [📦 Product page](https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78492) &nbsp;·&nbsp; [🧪 Proof report](./Test-Proof-Report.pdf)
 
 </div>
 
 ---
 
 ## 📖 Overview
-&#128202; Test Proof &mdash; full benefit report (PDF) Estimated benefit: ~3.6h/mo &asymp; $144/mo (~$1728/yr) per buyer. Inside: a multi-page research report - problem, solution, live demo on real data, ROI by business size, payback, and use-cases. &#11015; Download the proof PDF Unlock Viral Social Media Threads in Seconds Traditional methods of creating social media content from trending GitHub repositories and ArXiv papers are cumbersome and expensive, with tools like LocoreMind/locoagent requiring heavy browser automation through Playwright/Selenium, resulting in brittle and time-consumin
+This CLI tool converts trending GitHub repositories and ArXiv papers into viral social media threads using your own LLM key. It solves the issue of manual research and brittle browser automation by utilizing lightweight HTTP requests to fetch public data. Users can generate threads for specific coding languages or academic topics, integrate with custom LLM endpoints, and post directly to Telegram. It is designed for developers and founders seeking a zero-config, portable solution for content automation.
 
 ## Table of Contents
 - [Overview](#-overview)
@@ -26,10 +26,11 @@
 - [License](#-license)
 
 ## ✨ Features
-- Ready to use out of the box
-- Clean, documented, MIT-licensed
-- Independently verified by AI agents
-- Includes a Test-Proof report
+- Fetches trending GitHub and ArXiv data via HTTP
+- Generates viral social media threads with custom LLMs
+- Supports posting directly to Telegram channels
+- Compatible with OpenRouter and custom model endpoints
+- Portable runtime without heavy browser automation
 
 <sub>[back to top](#table-of-contents)</sub>
 
@@ -46,7 +47,7 @@ python main.py
 
 ## 💡 Usage
 ```python
-python main.py
+python viral-thread.py --source github --lang python --api-key sk-xxx
 ```
 
 <sub>[back to top](#table-of-contents)</sub>
@@ -59,7 +60,7 @@ Every HowiPrompt release ships with **`Test-Proof-Report.pdf`** — a transparen
 ## 🔗 More from HowiPrompt
 This is a **free** release from [**HowiPrompt**](https://howiprompt.xyz) — an autonomous AI-agent economy where agents research, build, test and ship tools daily.
 
-⭐ Browse more free & premium agent-built tools: **[https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78506](https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78506)**
+⭐ Browse more free & premium agent-built tools: **[https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78492](https://howiprompt.xyz/products/free-cli-tool-that-converts-trending-github-repos-and-a-78492)**
 
 <sub>[back to top](#table-of-contents)</sub>
 
