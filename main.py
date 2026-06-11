@@ -7,518 +7,419 @@ Why this exists: Unlike LocoreMind/locoagent which requires heavy/brittle browse
 """
 #!/usr/bin/env python3
 """
-TrendToThread - Viral Content Generator CLI
-
-A production-grade CLI tool that fetches trending technical content (GitHub 
-repositories or ArXiv research papers) and converts them into viral social 
-media threads using an LLM (OpenAI/OpenRouter). It supports outputting 
-formatted Markdown to stdout or posting directly to a Telegram channel.
-
-Features:
-- Fetches trending GitHub repos (via Search API) or ArXiv papers (via RSS).
-- Constructs detailed prompts for LLMs to generate "Hook + Bullets + Hashtags".
-- Outputs clean Markdown or posts to Telegram.
-- Graceful error handling, type hinting, and zero configuration (file-wise).
-- External dependency: `requests`.
+viral-thread.py: A CLI tool to convert trending GitHub repositories or ArXiv papers
+                 into viral social media threads using an LLM.
 
 Usage Examples:
-    # Fetch trending AI papers and print thread to console
-    $ export LLM_API_KEY="sk-..."
-    $ python trend_to_thread.py --source arxiv --limit 3 --model gpt-4o-mini
+    # Fetch trending Python repos and generate a thread for the top one
+    python viral-thread.py --source github --lang python --api-key sk-xxx
 
-    # Fetch trending GitHub repos (last 7 days) and post to Telegram
-    $ export GITHUB_TOKEN="ghp_..." # Optional, increases limits
-    $ export TG_BOT_TOKEN="123456:ABC-DEF..."
-    $ export TG_CHAT_ID="@mychannel"
-    $ python trend_to_thread.py --source github --limit 5 --post-telegram
+    # Fetch trending Machine Learning papers from ArXiv and post to Telegram
+    python viral-thread.py --source arxiv --api-key sk-xxx \
+        --tg-token 123456:ABC-DEF --chat-id @mychannel
 
     # Use OpenRouter with a specific model
-    $ export LLM_BASE_URL="https://openrouter.ai/api/v1"
-    $ export LLM_API_KEY="sk-or-..."
-    $ python trend_to_thread.py --source github --limit 1 --model anthropic/claude-3.5-sonnet
+    OPENAI_API_KEY=sk-xxx python viral-thread.py --source github \
+        --base-url https://openrouter.ai/api/v1 \
+        --model anthropic/claude-3-opus
 """
 
 import argparse
-import dataclasses
-import datetime
-import html
 import json
 import os
 import re
 import sys
-import typing
-import urllib.parse
+import textwrap
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-# Allowed external library as per spec
 import requests
 
+# Constants
+DEFAULT_GITHUB_API_URL = "https://api.github.com"
+DEFAULT_ARXIV_RSS_URL = "http://export.arxiv.org/api/query"
+DEFAULT_OPENAI_API_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
+REQUEST_TIMEOUT = 30
+UserAgent = "Mozilla/5.0 (compatible; ViralThreadBot/1.0; +https://example.com/bot)"
 
-# ---------------------------------------------------------------------------
-# Configuration & Constants
-# ---------------------------------------------------------------------------
 
-DEFAULT_GITHUB_API_URL = "https://api.github.com/search/repositories"
-DEFAULT_ARXIV_RSS_URL = "http://export.arxiv.org/api/query?"
-DEFAULT_LLM_API_URL = "https://api.openai.com/v1/chat/completions"
-DEFAULT_TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+# Exceptions
+class APIError(Exception):
+    """Custom exception for API failures."""
 
-DEFAULT_PROMPT_TEMPLATE = """
-You are an expert viral social media writer for X/Twitter and LinkedIn.
-Your task is to convert the following technical content into a high-engagement thread.
 
-Content Source: {source_type}
-Content Items:
-{content_data}
+class ConfigError(Exception):
+    """Custom exception for configuration issues."""
 
-Instructions:
-1. **The Hook**: Write a catchy, punchy first sentence (< 140 chars) that grabs attention immediately.
-2. **The Body**: Provide exactly 3 bullet points explaining the "Why it matters", "How it works", or "Key features".
-3. **The Hashtags**: Suggest 3-5 relevant, high-traffic hashtags.
 
-Format Requirements:
-- Return ONLY valid Markdown.
-- Use strict Markdown syntax (e.g., **bold**, `code`).
-- Do not include conversational filler (e.g., "Here is the thread").
-- Start immediately with the Hook.
-- Separate sections with double newlines.
-
-Example Output:
-Just deployed the future of AI agents. 🤖
-
-- This repo handles full autonomy with local LLMs
-- Zero latency compared to OpenAI wrappers
-- Works on Raspberry Pi
-
-#AI #OpenSource #Tech
-"""
-
-# ---------------------------------------------------------------------------
 # Data Models
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-class ContentItem:
-    """Unified data structure for a trending item (Repo or Paper)."""
+@dataclass
+class TrendingItem:
+    """Generic container for a trending item (Repo or Paper)."""
     title: str
     description: str
     url: str
-    metadata: dict  # Store extra info like stars, authors, published date
-
-    def to_markdown_bullet(self) -> str:
-        """Formats the item as a list item for the LLM context."""
-        meta_str = ", ".join([f"{k}: {v}" for k, v in self.metadata.items()])
-        return f"### {self.title}\n*{meta_str}*\n{self.description}\nLink: {self.url}"
+    author: str
+    stats: str  # e.g., "10k stars" or "20 citations"
 
 
-@dataclasses.dataclass
-class LLMConfig:
-    """Configuration for the LLM API client."""
-    api_key: str
-    base_url: str
-    model: str
-    timeout: int = 30
+# --- Helper Functions ---
+
+def get_env_key(key: str, cli_arg: Optional[str] = None) -> str:
+    """
+    Retrieves an API key from CLI argument or Environment Variable.
+    Raises ConfigError if missing.
+    """
+    if cli_arg:
+        return cli_arg
+    value = os.getenv(key)
+    if not value:
+        raise ConfigError(f"Missing API key. Set {key} env var or use --api-key.")
+    return value
 
 
-# ---------------------------------------------------------------------------
-# Fetchers (GitHub & ArXiv)
-# ---------------------------------------------------------------------------
-
-class FetcherError(Exception):
-    """Custom exception for fetching failures."""
-    pass
-
-
-class BaseFetcher(typing.Protocol):
-    def fetch(self, limit: int) -> typing.List[ContentItem]:
-        ...
+def clean_text(text: str) -> str:
+    """Removes HTML tags and excessive whitespace from text."""
+    if not text:
+        return ""
+    # Remove basic HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Collapse whitespace
+    return " ".join(text.split())
 
 
-class GitHubFetcher:
-    """Fetches trending repositories using GitHub Search API."""
+# --- Fetchers ---
+
+def fetch_github_trending(
+    language: str, limit: int = 5, token: Optional[str] = None
+) -> List[TrendingItem]:
+    """
+    Fetches top repositories from GitHub using the Search API.
+    Note: GitHub doesn't have a public 'trending' API, so we search
+    for repositories created in the last week sorted by stars.
+    """
+    print(f"[*] Fetching top {limit} trending {language} repos from GitHub...", file=sys.stderr)
     
-    def __init__(self, token: typing.Optional[str] = None):
-        self.token = token
-        self.headers = {"Accept": "application/vnd.github.v3+json"}
-        if token:
-            self.headers["Authorization"] = f"token {token}"
-
-    def fetch(self, limit: int = 5) -> typing.List[ContentItem]:
-        """
-        Fetches top repositories created in the last 7 days sorted by stars.
-        Note: GitHub public API rate limit is 60/hr without token, 5000/hr with token.
-        """
-        # Calculate date 7 days ago for 'trending' simulation via search
-        date_threshold = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-        
-        params = {
-            "q": f"created:>{date_threshold}",
-            "sort": "stars",
-            "order": "desc",
-            "per_page": limit
-        }
-
-        try:
-            response = requests.get(
-                DEFAULT_GITHUB_API_URL, 
-                headers=self.headers, 
-                params=params, 
-                timeout=20
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            items = []
-            for item in data.get("items", []):
-                # Clean description
-                desc = item.get("description") or "No description provided."
-                
-                meta = {
-                    "stars": item.get("stargazers_count", 0),
-                    "language": item.get("language") or "Unknown",
-                    "owner": item.get("owner", {}).get("login")
-                }
-                
-                items.append(ContentItem(
-                    title=item.get("full_name"),
-                    description=desc,
-                    url=item.get("html_url"),
-                    metadata=meta
-                ))
-            return items
-            
-        except requests.exceptions.RequestException as e:
-            raise FetcherError(f"Failed to fetch GitHub data: {e}")
-        except json.JSONDecodeError as e:
-            raise FetcherError(f"Invalid GitHub API response: {e}")
-
-
-class ArxivFetcher:
-    """Fetches trending papers via ArXiv RSS API."""
-
-    def fetch(self, limit: int = 5) -> typing.List[ContentItem]:
-        """
-        Fetches recent papers from cs.AI or cs.LG categories.
-        """
-        # Search for AI or Machine Learning papers, sorted by submitted date
-        query = "cat:cs.AI+OR+cat:cs.LG"
-        params = {
-            "search_query": query,
-            "start": 0,
-            "max_results": limit,
-            "sortBy": "submittedDate",
-            "sortOrder": "descending"
-        }
-        
-        url = f"{DEFAULT_ARXIV_RSS_URL}{urllib.parse.urlencode(params)}"
-
-        try:
-            response = requests.get(url, timeout=20)
-            response.raise_for_status()
-            
-            # Parse XML
-            root = ET.fromstring(response.text)
-            # ArXiv uses the Atom namespace
-            namespace = {'atom': 'http://www.w3.org/2005/Atom'}
-            
-            items = []
-            for entry in root.findall("atom:entry", namespace):
-                title = entry.find("atom:title", namespace).text.strip()
-                summary = entry.find("atom:summary", namespace).text.strip()
-                # Remove newlines from summary for cleaner processing
-                summary = re.sub(r"\s+", " ", summary)
-                
-                # Get ID and convert to abstract URL
-                arxiv_id = entry.find("atom:id", namespace).text.split("/abs/")[-1]
-                url = f"https://arxiv.org/abs/{arxiv_id}"
-                
-                # Parse authors
-                authors = []
-                for author in entry.findall("atom:author", namespace):
-                    name = author.find("atom:name", namespace).text
-                    authors.append(name)
-                
-                meta = {
-                    "published": entry.find("atom:published", namespace).text,
-                    "primary_category": entry.find("atom:primary_category", namespace).attrib.get("term"),
-                    "authors": ", ".join(authors[:3]) + ("..." if len(authors) > 3 else "")
-                }
-                
-                items.append(ContentItem(
-                    title=title,
-                    description=html.unescape(summary),
-                    url=url,
-                    metadata=meta
-                ))
-            return items
-            
-        except requests.exceptions.RequestException as e:
-            raise FetcherError(f"Failed to fetch ArXiv data: {e}")
-        except ET.ParseError as e:
-            raise FetcherError(f"Failed to parse ArXiv XML feed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# LLM Service
-# ---------------------------------------------------------------------------
-
-class LLMClient:
-    """Handles interaction with OpenAI/OpenRouter compatible APIs."""
-
-    def __init__(self, config: LLMConfig):
-        self.config = config
-
-    def generate_thread(self, items: typing.List[ContentItem]) -> str:
-        """
-        Sends the fetched items to the LLM and returns the generated thread.
-        """
-        if not items:
-            raise ValueError("No content items provided for generation.")
-
-        # Construct the context string
-        content_data = "\n\n".join([item.to_markdown_bullet() for item in items])
-        
-        prompt = DEFAULT_PROMPT_TEMPLATE.format(
-            source_type="GitHub Repositories" if "github" in items[0].url.lower() else "ArXiv Papers",
-            content_data=content_data
+    # Calculate date range (past 7 days)
+    date_threshold = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    query = f"language:{language} created:>{date_threshold}"
+    params = {
+        "q": query,
+        "sort": "stars",
+        "order": "desc",
+        "per_page": limit
+    }
+    
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    
+    try:
+        resp = requests.get(
+            f"{DEFAULT_GITHUB_API_URL}/search/repositories",
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT
         )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise APIError(f"GitHub API request failed: {e}")
 
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json"
-        }
+    data = resp.json()
+    items: List[TrendingItem] = []
+    
+    for repo in data.get("items", []):
+        name = repo.get("full_name")
+        desc = repo.get("description") or "No description provided."
+        url = repo.get("html_url")
+        stars = repo.get("stargazers_count")
+        owner = repo.get("owner", {}).get("login")
+        
+        stat_str = f"{stars:,} stars"
+        items.append(TrendingItem(name, desc, url, owner, stat_str))
+        
+    return items
 
-        payload = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant that generates viral social media content."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7
-        }
 
+def fetch_arxiv_papers(category: str, limit: int = 5) -> List[TrendingItem]:
+    """
+    Fetches top recent papers from ArXiv using the RSS API.
+    """
+    print(f"[*] Fetching top {limit} papers from ArXiv ({category})...", file=sys.stderr)
+    
+    # ArXiv query syntax: cat:cs.AI
+    search_query = f"cat:{category}"
+    params = {
+        "search_query": search_query,
+        "start": 0,
+        "max_results": limit,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending"
+    }
+    
+    try:
+        resp = requests.get(DEFAULT_ARXIV_RSS_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise APIError(f"ArXiv API request failed: {e}")
+
+    # Parse XML
+    root = ET.fromstring(resp.content)
+    
+    # ArXiv uses namespaces, which is annoying.
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    
+    items: List[TrendingItem] = []
+    
+    for entry in root.findall("atom:entry", ns):
+        title = entry.find("atom:title", ns).text
+        summary = entry.find("atom:summary", ns).text
+        # ArXiv IDs look like http://arxiv.org/abs/2301.00001v1
+        link = entry.find("atom:id", ns).text
+        
+        # Extract author (first one)
+        authors = entry.findall("atom:author/atom:name", ns)
+        author_str = authors[0].text if authors else "Unknown"
+        
+        # Published date
+        published = entry.find("atom:published", ns).text
+        date_obj = datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
+        days_ago = (datetime.utcnow() - date_obj).days
+        
+        items.append(TrendingItem(
+            title=title.strip(),
+            description=clean_text(summary),
+            url=link,
+            author=author_str,
+            stats=f"Published {days_ago} days ago"
+        ))
+
+    return items
+
+
+# --- LLM Integration ---
+
+def call_llm(
+    api_key: str,
+    base_url: str,
+    model: str,
+    context: str
+) -> str:
+    """
+    Calls the OpenAI-compatible API (OpenRouter or OpenAI) to generate a thread.
+    """
+    print(f"[*] Calling LLM ({model}) to generate thread...", file=sys.stderr)
+    
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    
+    # System prompt specifically designed for "Virality"
+    system_prompt = textwrap.dedent("""
+        You are an expert social media growth manager. Your goal is to convert 
+        technical content (GitHub repositories or Research Papers) into a 
+        high-engagement, viral Twitter/X thread.
+        
+        Rules:
+        1. Start with a HOOK. A catchy, short sentence (max 15 words) that grabs attention.
+        2. Provide exactly 3 bullet points explaining *why* this matters or what problem it solves.
+        3. Keep lines concise. Use emojis sparingly but effectively.
+        4. End with a line of relevant hashtags (e.g., #AI #OpenSource #DevTools).
+        5. Do not include markdown code blocks in the output, just the text formatted clearly.
+        6. If it's a GitHub repo, focus on utility. If it's a paper, focus on the breakthrough.
+        
+        Output Format:
+        HOOK
+        - Point 1
+        - Point 2
+        - Point 3
+        #Tags
+    """)
+    
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 300
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://viral-thread-cli.local", 
+        "X-Title": "Viral Thread CLI"
+    }
+    
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise APIError(f"LLM Provider request failed: {e}")
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content.strip()
+    except (KeyError, IndexError) as e:
+        raise APIError(f"LLM Provider returned invalid response format: {e}")
+
+
+# --- Output Handling ---
+
+def post_to_telegram(token: str, chat_id: str, text: str) -> None:
+    """
+    Posts the generated thread to a Telegram channel.
+    """
+    print(f"[*] Posting to Telegram chat {chat_id}...", file=sys.stderr)
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown" # Attempt Markdown parsing
+    }
+    
+    try:
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        # Try parsing the error message from Telegram JSON
+        err_detail = "Unknown error"
         try:
-            response = requests.post(
-                self.config.base_url,
-                headers=headers,
-                json=payload,
-                timeout=self.config.timeout
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if "choices" not in data or not data["choices"]:
-                raise ValueError("LLM API returned an unexpected format (no choices).")
-                
-            return data["choices"][0]["message"]["content"].strip()
-
-        except requests.exceptions.RequestException as e:
-            raise ConnectionError(f"LLM API Request failed: {e}")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            raise ValueError(f"Failed to parse LLM API response: {e}")
+            err_detail = resp.json().get("description", str(e))
+        except:
+            pass
+        raise APIError(f"Telegram API failed: {err_detail}")
 
 
-# ---------------------------------------------------------------------------
-# Telegram Service
-# ---------------------------------------------------------------------------
+# --- Main Logic ---
 
-class TelegramPoster:
-    """Posts formatted content to a Telegram Channel."""
-
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.url = DEFAULT_TELEGRAM_API_URL.format(token=bot_token)
-
-    def _convert_markdown_to_html(self, text: str) -> str:
-        """
-        Simple converter to make LLM Markdown compatible with Telegram HTML.
-        Telegram HTML parsing is strict; we convert basic MD to HTML tags.
-        """
-        # Escape existing HTML special chars to avoid injection
-        text = html.escape(text)
-        
-        # Convert Bold: **text** -> <b>text</b>
-        text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
-        
-        # Convert Italic: *text* -> <i>text</i>
-        text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
-        
-        # Convert Code: `text` -> <code>text</code>
-        text = re.sub(r"`(.*?)`", r"<code>\1</code>", text)
-        
-        # Convert Links: [text](url) -> <a href="url">text</a>
-        text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', text)
-        
-        return text
-
-    def post(self, content: str) -> bool:
-        """Sends the message to Telegram."""
-        html_content = self._convert_markdown_to_html(content)
-        
-        payload = {
-            "chat_id": self.chat_id,
-            "text": html_content,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false"
-        }
-
-        try:
-            response = requests.post(self.url, data=payload, timeout=20)
-            response.raise_for_status()
-            result = response.json()
-            if not result.get("ok"):
-                print(f"Warning: Telegram API returned error: {result.get('description')}", file=sys.stderr)
-                return False
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to post to Telegram: {e}", file=sys.stderr)
-            return False
-
-
-# ---------------------------------------------------------------------------
-# CLI Application
-# ---------------------------------------------------------------------------
-
-def parse_arguments() -> argparse.Namespace:
-    """Sets up and parses CLI arguments."""
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="TrendToThread: Convert technical trends into viral social media content.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
-  # Generate thread for top 3 ArXiv papers
-  python trend_to_thread.py --source arxiv --limit 3
-  
-  # Generate thread for top 5 GitHub repos and post to Telegram
-  export TG_BOT_TOKEN="123:ABC"
-  export TG_CHAT_ID="@channel"
-  python trend_to_thread.py --source github --limit 5 --post-telegram
-        """
+        description="Convert trending GitHub/ArXiv content into viral social media threads."
     )
     
+    # Source Args
     parser.add_argument(
         "--source", 
         choices=["github", "arxiv"], 
-        required=True,
-        help="Content source to fetch trending topics from."
+        required=True, 
+        help="Data source to use."
     )
-    
     parser.add_argument(
-        "--limit", 
-        type=int, 
-        default=3, 
-        help="Number of items to fetch (default: 3)."
+        "--lang", 
+        default="python", 
+        help="GitHub language filter (only for source=github)."
+    )
+    parser.add_argument(
+        "--cat", 
+        default="cs.AI", 
+        help="ArXiv category filter (only for source=arxiv, e.g., cs.AI, cs.LG)."
     )
     
+    # LLM Args
+    parser.add_argument(
+        "--api-key", 
+        default=None, 
+        help="LLM API Key (reads OPENAI_API_KEY env var if not provided)."
+    )
+    parser.add_argument(
+        "--base-url", 
+        default=DEFAULT_OPENAI_API_URL, 
+        help="Base URL for LLM API (defaults to OpenAI)."
+    )
     parser.add_argument(
         "--model", 
-        default="gpt-4o-mini",
-        help="LLM model to use (e.g., gpt-4o-mini, claude-3-haiku). Must be compatible with OpenAI API format."
+        default=DEFAULT_MODEL, 
+        help="Model name to use."
     )
     
+    # Telegram Args
     parser.add_argument(
-        "--post-telegram",
-        action="store_true",
-        help="If set, posts the output to Telegram using env vars TG_BOT_TOKEN and TG_CHAT_ID."
+        "--tg-token", 
+        default=None, 
+        help="Telegram Bot Token."
     )
-    
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Fetch data and construct prompt, but do not call the LLM (prints prompt debug)."
+        "--chat-id", 
+        default=None, 
+        help="Telegram Chat ID (channel or user)."
     )
-    
-    return parser.parse_args()
 
+    args = parser.parse_args()
 
-def load_environment_config() -> dict:
-    """Loads API keys and tokens from environment variables."""
-    config = {}
-    
-    config["llm_key"] = os.environ.get("LLM_API_KEY")
-    # Allow fallback to OPENAI_API_KEY for convenience
-    if not config["llm_key"]:
-        config["llm_key"] = os.environ.get("OPENAI_API_KEY")
-        
-    config["llm_base_url"] = os.environ.get("LLM_BASE_URL", DEFAULT_LLM_API_URL)
-    config["github_token"] = os.environ.get("GITHUB_TOKEN")
-    
-    config["tg_token"] = os.environ.get("TG_BOT_TOKEN")
-    config["tg_chat_id"] = os.environ.get("TG_CHAT_ID")
-    
-    return config
-
-
-def main():
-    args = parse_arguments()
-    env_config = load_environment_config()
-    
-    # 1. Validation
-    if not env_config["llm_key"] and not args.dry_run:
-        print("Error: LLM_API_KEY (or OPENAI_API_KEY) environment variable not set.", file=sys.stderr)
-        sys.exit(1)
-        
-    if args.post_telegram:
-        if not env_config["tg_token"] or not env_config["tg_chat_id"]:
-            print("Error: Both TG_BOT_TOKEN and TG_CHAT_ID must be set for Telegram posting.", file=sys.stderr)
-            sys.exit(1)
-
-    # 2. Fetch Data
-    fetcher: BaseFetcher
     try:
-        if args.source == "github":
-            fetcher = GitHubFetcher(token=env_config["github_token"])
-        else:
-            fetcher = ArxivFetcher()
-            
-        print(f"[*] Fetching trending {args.source.upper()} content...", file=sys.stderr)
-        items = fetcher.fetch(limit=args.limit)
-        print(f"[*] Fetched {len(items)} items successfully.\n", file=sys.stderr)
+        # 1. Validate Credentials
+        llm_key = get_env_key("OPENAI_API_KEY", args.api_key)
         
-    except FetcherError as e:
-        print(f"Error fetching data: {e}", file=sys.stderr)
-        sys.exit(1)
+        # Optional GitHub Token (for higher rate limits)
+        github_token = os.getenv("GITHUB_TOKEN")
+        
+        # Validate Telegram pair
+        if (args.tg_token and not args.chat_id) or (args.chat_id and not args.tg_token):
+            raise ConfigError("Both --tg-token and --chat-id are required for Telegram posting.")
 
-    # 3. Generate Thread (unless dry run)
-    thread_content = ""
-    
-    if args.dry_run:
-        # In dry run, construct the prompt manually for inspection
-        content_data = "\n\n".join([item.to_markdown_bullet() for item in items])
-        thread_content = DEFAULT_PROMPT_TEMPLATE.format(
-            source_type=args.source,
-            content_data=content_data
-        )
-        print("--- DRY RUN: PROMPT ---\n", file=sys.stderr)
-        print(thread_content)
-        sys.exit(0)
-    else:
-        try:
-            llm_config = LLMConfig(
-                api_key=env_config["llm_key"],
-                base_url=env_config["llm_base_url"],
-                model=args.model
-            )
-            client = LLMClient(llm_config)
-            print("[*] Generating viral thread...", file=sys.stderr)
-            thread_content = client.generate_thread(items)
-        except (ValueError, ConnectionError) as e:
-            print(f"Error during LLM generation: {e}", file=sys.stderr)
+        # 2. Fetch Data
+        items: List[TrendingItem] = []
+        if args.source == "github":
+            items = fetch_github_trending(args.lang, limit=1, token=github_token)
+        elif args.source == "arxiv":
+            items = fetch_arxiv_papers(args.cat, limit=1)
+            
+        if not items:
+            print("[!] No items found. Check filters.", file=sys.stderr)
             sys.exit(1)
+            
+        top_item = items[0]
+        print(f"[+] Selected: {top_item.title} ({top_item.stats})", file=sys.stderr)
 
-    # 4. Output
-    if args.post_telegram:
-        print("[*] Posting to Telegram...", file=sys.stderr)
-        poster = TelegramPoster(env_config["tg_token"], env_config["tg_chat_id"])
-        if poster.post(thread_content):
+        # 3. Construct Context
+        context = f"""
+        Topic: {top_item.title}
+        Author: {top_item.author}
+        Stats: {top_item.stats}
+        Link: {top_item.url}
+        
+        Description/Abstract:
+        {top_item.description}
+        """
+        
+        # 4. Generate Thread
+        generated_content = call_llm(llm_key, args.base_url, args.model, context)
+        
+        # Add a footer with the link
+        final_output = f"{generated_content}\n\nRead more: {top_item.url}"
+        
+        # 5. Output
+        if args.tg_token and args.chat_id:
+            post_to_telegram(args.tg_token, args.chat_id, final_output)
             print("[+] Successfully posted to Telegram.", file=sys.stderr)
         else:
-            print("[-] Failed to post to Telegram. Printing content instead:", file=sys.stderr)
-            print("\n" + thread_content)
-    else:
-        # Output Raw Markdown to stdout
-        print(thread_content)
+            # Markdown Header format
+            print(f"# Viral Thread: {top_item.title}")
+            print(f"**Source:** [{args.source.upper()}]({top_item.url})  \n")
+            print("---")
+            print()
+            print(final_output)
+
+    except (ConfigError, APIError) as e:
+        print(f"[Error] {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[Interrupted] Exiting.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"[Unexpected Error] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
+    if "requests" not in sys.modules:
+        print("This tool requires the 'requests' library. Please install it: pip install requests", file=sys.stderr)
+        sys.exit(1)
     main()
